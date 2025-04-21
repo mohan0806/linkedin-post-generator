@@ -1,0 +1,8 @@
+# Ignore everything by default
+*
+
+# But keep these specific files:
+!requirements.txt
+!linkedin_streamlit_app.py
+!README.md
+!.gitignore
