@@ -18,7 +18,7 @@ This Streamlit application helps you generate engaging LinkedIn posts summarizin
 
 ```bash
 git clone https://github.com/mohan0806/linkedin-post-generator.git
-cd <your-repo-directory>
+cd linkedin-post-generator
 ```
 
 ### 2. Create a Virtual Environment (Recommended)
