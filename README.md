@@ -73,8 +73,6 @@ GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
 
 ## ▶️ How to Run
 
-[Watch the Demo Video](Linkedin Post Generator.mp4) 🎬
-
 With setup complete, launch the Streamlit app from your terminal:
 
 ```bash
