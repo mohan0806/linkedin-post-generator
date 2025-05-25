@@ -4,13 +4,157 @@ from urllib.parse import urlparse, parse_qs
 import googleapiclient.discovery
 import google.generativeai as genai
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from requests_oauthlib import OAuth2Session
+import os
 
 # --- API Keys (Replace with your actual API keys or use Streamlit secrets) ---
 YOUTUBE_API_KEY = st.secrets.get("YOUTUBE_API_KEY") # Use Streamlit secrets for API keys
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") # Use Streamlit secrets for API keys
+LINKEDIN_CLIENT_ID = st.secrets.get("LINKEDIN_CLIENT_ID") # Use Streamlit secrets for LinkedIn OAuth
+LINKEDIN_CLIENT_SECRET = st.secrets.get("LINKEDIN_CLIENT_SECRET") # Use Streamlit secrets for LinkedIn OAuth
+LINKEDIN_REDIRECT_URI = st.secrets.get("LINKEDIN_REDIRECT_URI") # For OAuth callback
+
+# --- LinkedIn OAuth Constants ---
+LINKEDIN_AUTHORIZATION_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+
+# --- Handle LinkedIn OAuth Callback ---
+query_params = st.experimental_get_query_params()
+auth_code = query_params.get("code", [None])[0]
+received_state = query_params.get("state", [None])[0]
+
+if auth_code and received_state:
+    if 'linkedin_oauth_state' not in st.session_state:
+        st.error("LinkedIn OAuth state missing. Please try logging in again.")
+    elif received_state != st.session_state.get('linkedin_oauth_state'):
+        st.error("LinkedIn OAuth state mismatch (CSRF detected). Please try logging in again.")
+        if 'linkedin_oauth_state' in st.session_state:
+            del st.session_state['linkedin_oauth_state']
+        st.experimental_set_query_params() # Clear query params
+    else:
+        # State is valid, now fetch the token
+        with st.spinner("Authenticating with LinkedIn and fetching token..."):
+            try:
+                linkedin = OAuth2Session(
+                    LINKEDIN_CLIENT_ID,
+                    redirect_uri=LINKEDIN_REDIRECT_URI
+                )
+                token = linkedin.fetch_token(
+                    LINKEDIN_TOKEN_URL,
+                    client_secret=LINKEDIN_CLIENT_SECRET,
+                    code=auth_code 
+                )
+                st.session_state.linkedin_token = token
+                if 'linkedin_oauth_state' in st.session_state:
+                    del st.session_state.linkedin_oauth_state
+                if 'linkedin_auth_code' in st.session_state:
+                    del st.session_state.linkedin_auth_code
+                
+                st.experimental_set_query_params()
+                st.experimental_rerun()
+
+            except Exception as e:
+                st.error(f"LinkedIn login failed: Could not retrieve access token. Error: {e}. Please ensure your Redirect URI is correctly configured in your LinkedIn App and Streamlit secrets, and that the client secret is valid.")
+                if 'linkedin_oauth_state' in st.session_state:
+                    del st.session_state.linkedin_oauth_state
+                st.experimental_set_query_params()
+
+# --- Function to fetch LinkedIn User Profile ---
+def get_linkedin_user_profile(token):
+    """Fetches LinkedIn user profile using the access token."""
+    if not token:
+        # This case should ideally not be reached if logic flow is correct
+        st.error("No LinkedIn token provided to fetch profile.")
+        return None
+    with st.spinner("Fetching your LinkedIn profile information..."):
+        try:
+            linkedin_session = OAuth2Session(token=token)
+            response = linkedin_session.get("https://api.linkedin.com/v2/userinfo")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            st.error(f"Error fetching LinkedIn user profile: {e}. Your token might be invalid or expired.")
+            if 'linkedin_token' in st.session_state:
+                del st.session_state.linkedin_token # Clear potentially bad token
+            # No rerun here, allow user to see the error then manually try login again if needed
+            return None
+
+# --- Fetch and store user profile if token exists but user_name doesn't ---
+if 'linkedin_token' in st.session_state and 'linkedin_user_name' not in st.session_state:
+    user_profile = get_linkedin_user_profile(st.session_state.linkedin_token)
+    if user_profile:
+        user_name = user_profile.get('name')
+        if not user_name:
+            user_name = user_profile.get('given_name', 'LinkedIn User')
+        st.session_state.linkedin_user_name = user_name
+        
+        user_urn = user_profile.get('sub')
+        if not user_urn:
+            st.error("Failed to retrieve necessary user details (URN) from LinkedIn. Posting disabled. Please try logging out and in again.")
+            # Clear potentially incomplete login state
+            if 'linkedin_token' in st.session_state: del st.session_state.linkedin_token
+            if 'linkedin_user_name' in st.session_state: del st.session_state.linkedin_user_name
+            st.experimental_rerun() # Rerun to reflect cleared state
+        else:
+            st.session_state.linkedin_user_urn = user_urn
+    else:
+        # Profile fetch failed, get_linkedin_user_profile already showed an error.
+        # Consider clearing token here if profile is essential and fetch consistently fails.
+        if 'linkedin_token' in st.session_state: # If profile fetch fails, token might be bad
+             del st.session_state.linkedin_token
+             if 'linkedin_user_name' in st.session_state: del st.session_state.linkedin_user_name # also clear name
+             st.warning("Cleared LinkedIn token due to profile fetch error. Please try logging in again.")
+             st.experimental_rerun()
+
+
+# --- Function to Post to LinkedIn ---
+def post_to_linkedin(token_dict, user_urn, post_text):
+    """Posts the given text to LinkedIn on behalf of the user."""
+    if not token_dict or not user_urn or not post_text:
+        st.error("Missing token, user URN, or post text for LinkedIn.")
+        return False
+
+    linkedin_session = OAuth2Session(token=token_dict)
+    
+    post_payload = {
+        "author": user_urn,  # user_urn from /userinfo is the complete URN
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {
+                    "text": post_text
+                },
+                "shareMediaCategory": "NONE"
+            }
+        },
+        "visibility": {
+            "com.linkedin.ugc.MemberNetworkVisibility": "CONNECTIONS" 
+        }
+    }
+
+    try:
+        response = linkedin_session.post("https://api.linkedin.com/v2/ugcPosts", json=post_payload)
+        response.raise_for_status() 
+        return True # Success if no exception for 4XX/5XX and 201 is typical for create
+    except Exception as e:
+        error_message = str(e)
+        try:
+            # Attempt to parse more specific error from response if available
+            error_details = response.json()
+            if "message" in error_details:
+                error_message = error_details["message"]
+        except: # Keep original exception message if parsing fails
+            pass
+        st.error(f"Failed to post to LinkedIn. API Error: {error_message}")
+        return False
+
 
 if not YOUTUBE_API_KEY or not GEMINI_API_KEY:
     st.error("Please set your YouTube API key and Gemini API key in Streamlit secrets.")
+    st.stop()
+
+if not LINKEDIN_CLIENT_ID or not LINKEDIN_CLIENT_SECRET or not LINKEDIN_REDIRECT_URI:
+    st.error("Please set your LinkedIn Client ID, Client Secret, and Redirect URI in Streamlit secrets for LinkedIn integration.")
     st.stop()
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -190,6 +334,42 @@ def create_knowledge_linkedin_post_from_youtube(youtube_link): # Renamed functio
 st.title("💡 LinkedIn Knowledge Post Generator 🚀") # Updated Title
 st.subheader("Share valuable insights from YouTube videos with your LinkedIn network!") # Updated Subheader
 
+# --- LinkedIn OAuth UI ---
+if 'linkedin_token' not in st.session_state:
+    st.subheader("LinkedIn Integration")
+    # Scopes: openid for OpenID Connect, profile for basic profile data, w_member_social for posting
+    linkedin_oauth_scope = ["openid", "profile", "w_member_social"] 
+    linkedin = OAuth2Session(
+        LINKEDIN_CLIENT_ID, 
+        redirect_uri=LINKEDIN_REDIRECT_URI, 
+        scope=linkedin_oauth_scope
+    )
+    authorization_url, state = linkedin.authorization_url(LINKEDIN_AUTHORIZATION_URL)
+    
+    # Store state for verification after callback
+    st.session_state.linkedin_oauth_state = state
+
+    # Using st.link_button for a cleaner UI to redirect to LinkedIn
+    if st.link_button("Login with LinkedIn", authorization_url):
+        # This part will not be executed as st.link_button causes an immediate redirect
+        # However, it's good practice to think about the flow.
+        # The user will be redirected to LinkedIn's authorization page.
+        # After authorization, LinkedIn will redirect back to LINKEDIN_REDIRECT_URI 
+        # with 'code' and 'state' as query parameters.
+        pass
+else:
+    st.subheader("LinkedIn Integration")
+    user_display_name = st.session_state.get('linkedin_user_name', 'User')
+    st.success(f"Logged in to LinkedIn as {user_display_name}.")
+    if st.button("Logout from LinkedIn"):
+        # Clear all LinkedIn related session state
+        for key in list(st.session_state.keys()):
+            if key.startswith('linkedin_'):
+                del st.session_state[key]
+        st.experimental_rerun() # Rerun to update UI
+
+st.markdown("---") # Separator
+
 youtube_url_input = st.text_input("Enter YouTube Video Link (for analysis - URL will NOT be in the post):", placeholder="https://www.youtube.com/watch?v=...") # Updated Input Label
 
 if st.button("Generate Knowledge Post"): # Updated Button Label
@@ -241,7 +421,29 @@ if "generated_post" in st.session_state:
     st.subheader("Generated LinkedIn Knowledge Post:") # Updated Subheader
     st.markdown(st.session_state.generated_post) # Changed st.code to st.markdown
 
-    st.markdown("---")
+    st.markdown("---") # Separator before LinkedIn post button
+
+    # --- LinkedIn Post Button ---
+    if 'linkedin_token' in st.session_state and 'linkedin_user_urn' in st.session_state:
+        if st.button("🚀 Post to LinkedIn"):
+            with st.spinner("Posting to LinkedIn..."):
+                post_success = post_to_linkedin(
+                    st.session_state.linkedin_token,
+                    st.session_state.linkedin_user_urn,
+                    st.session_state.generated_post
+                )
+                if post_success:
+                    st.success("Successfully posted to LinkedIn!")
+                    st.balloons()
+                else:
+                    st.error("Failed to post to LinkedIn. Please check your app permissions or try logging out and in again.")
+    elif 'linkedin_token' in st.session_state: # Token exists but URN might be missing
+        st.warning("Could not retrieve your LinkedIn User ID (URN) for posting. Please try logging out and then logging back in to LinkedIn.")
+    else: # Not logged into LinkedIn
+        st.info("Login with LinkedIn to enable direct posting.")
+
+
+    st.markdown("---") # Separator after LinkedIn post button
     st.markdown("💡 **Tips for LinkedIn:**")
     st.markdown("- Consider adding a relevant image to enhance your post.") # Updated tip
     st.markdown("- Tag relevant people or companies if applicable.")
